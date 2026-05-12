@@ -1,6 +1,7 @@
 from flask import Blueprint, request, jsonify
 from app import db
-from app.models import Sale
+from app.models import Sale, ImportLog
+from app.services.etl import process_upload_sync
 import pandas as pd
 import io
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -17,47 +18,29 @@ def upload_data():
     if file.filename == '':
         return jsonify({"msg": "No selected file"}), 400
 
-    try:
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.StringIO(file.stream.read().decode("UTF8")))
-        elif file.filename.endswith(('.xls', '.xlsx')):
-            df = pd.read_excel(file.stream)
-        else:
-            return jsonify({"msg": "Unsupported file format"}), 400
-
-        # Required columns check (case-insensitive for convenience)
-        required_cols = ['product', 'region', 'date', 'sales']
-        df.columns = [c.lower() for c in df.columns]
-        
-        if not all(col in df.columns for col in required_cols):
-            return jsonify({"msg": f"Missing columns. Required: {required_cols}"}), 400
-
-        # Basic cleaning
-        df = df.dropna(subset=required_cols)
-        df['date'] = pd.to_datetime(df['date'])
-        
-        user_id = get_jwt_identity()
-
-        for _, row in df.iterrows():
-            sale = Sale(
-                product=row['product'],
-                region=row['region'],
-                date=row['date'],
-                sales_value=row['sales'],
-                user_id=user_id
-            )
-            db.session.add(sale)
-        
-        db.session.commit()
-        return jsonify({"msg": f"Successfully uploaded {len(df)} rows"}), 201
-
-    except Exception as e:
-        return jsonify({"msg": str(e)}), 500
+    user_id = get_jwt_identity()
+    file_content = file.read()
+    
+    # Process synchronously for now
+    success, log_id = process_upload_sync(file_content, file.filename, user_id)
+    
+    log = ImportLog.query.get(log_id)
+    
+    if success:
+        return jsonify({
+            "msg": f"Successfully processed {log.rows_processed} rows",
+            "log_id": log.id
+        }), 201
+    else:
+        return jsonify({
+            "msg": "Data processing failed",
+            "error": log.errors
+        }), 500
 
 @data_bp.route('/data', methods=['GET'])
 @jwt_required()
 def get_data():
-    sales = Sale.query.all()
+    sales = Sale.query.order_by(Sale.date.desc()).limit(1000).all() # Limit to avoid huge payloads
     output = []
     for sale in sales:
         output.append({
@@ -68,3 +51,18 @@ def get_data():
             "sales_value": sale.sales_value
         })
     return jsonify(output), 200
+
+@data_bp.route('/import-logs', methods=['GET'])
+@jwt_required()
+def get_import_logs():
+    user_id = get_jwt_identity()
+    logs = ImportLog.query.filter_by(user_id=user_id).order_by(ImportLog.created_at.desc()).limit(20).all()
+    return jsonify([{
+        "id": log.id,
+        "filename": log.filename,
+        "status": log.status,
+        "rows_processed": log.rows_processed,
+        "errors": log.errors,
+        "created_at": log.created_at.isoformat()
+    } for log in logs]), 200
+

@@ -9,3 +9,4 @@ statsmodels
 bcrypt
 openpyxl
 python-dotenv
+psutil

@@ -20,11 +20,13 @@ def create_app(config_class=Config):
     from app.routes.predict import predict_bp
     from app.routes.dashboard import dashboard_bp
     from app.routes.admin import admin_bp
+    from app.routes.profile import profile_bp
 
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
     app.register_blueprint(data_bp, url_prefix='/api')
     app.register_blueprint(predict_bp, url_prefix='/api')
     app.register_blueprint(dashboard_bp, url_prefix='/api/dashboard')
     app.register_blueprint(admin_bp, url_prefix='/api/users')
+    app.register_blueprint(profile_bp, url_prefix='/api/profile')
 
     return app

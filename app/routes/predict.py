@@ -1,10 +1,9 @@
 from flask import Blueprint, request, jsonify
 from app import db
 from app.models import Sale, Prediction
+from app.services.ml_engine import ForecastingModel
 import pandas as pd
-from sklearn.linear_model import LinearRegression
-import numpy as np
-from datetime import timedelta
+from datetime import datetime
 from flask_jwt_extended import jwt_required
 
 predict_bp = Blueprint('predict', __name__)
@@ -16,6 +15,7 @@ def predict():
     product = data.get('product')
     region = data.get('region')
     horizon = int(data.get('horizon', 6)) # Months
+    model_choice = data.get('model', 'auto') # 'auto', 'Linear Regression', 'Random Forest', 'ARIMA'
 
     # Get historical data
     query = Sale.query
@@ -25,44 +25,70 @@ def predict():
         query = query.filter_by(region=region)
     
     sales = query.all()
-    if len(sales) < 2:
-        return jsonify({"msg": "Not enough data for prediction"}), 400
+    if len(sales) < 5:
+        return jsonify({"msg": "Not enough data for advanced prediction (minimum 5 points required)"}), 400
 
+    # Prepare data for ML engine
     df = pd.DataFrame([{
         "date": s.date,
-        "value": s.sales_value
+        "sales_value": float(s.sales_value)
     } for s in sales])
 
-    df = df.sort_values('date')
-    df['date_ordinal'] = df['date'].map(lambda x: x.toordinal())
-
-    X = df[['date_ordinal']].values
-    y = df['value'].values
-
-    model = LinearRegression()
-    model.fit(X, y)
-
-    # Predict future dates
-    last_date = df['date'].max()
-    predictions = []
-    
-    for i in range(1, horizon + 1):
-        future_date = last_date + pd.DateOffset(months=i)
-        pred_value = model.predict([[future_date.toordinal()]])[0]
+    try:
+        # Initialize ML Engine
+        engine = ForecastingModel(df)
         
-        # Save prediction
-        prediction = Prediction(
-            predicted_value=float(pred_value),
-            date=future_date,
-            model_type="Linear Regression",
-            product=product,
-            region=region
-        )
-        db.session.add(prediction)
-        predictions.append({
-            "date": future_date.strftime('%Y-%m-%d'),
-            "predicted_value": round(float(pred_value), 2)
-        })
+        if model_choice == 'auto':
+            best_model_name, forecast_results, accuracy = engine.auto_forecast(horizon_months=horizon)
+        elif model_choice == 'Random Forest':
+            forecast_results, accuracy = engine.predict_random_forest(horizon_months=horizon)
+            best_model_name = 'Random Forest'
+        elif model_choice == 'ARIMA':
+            forecast_results, accuracy = engine.predict_arima(horizon_months=horizon)
+            best_model_name = 'ARIMA'
+        else:
+            forecast_results, accuracy = engine.predict_linear(horizon_months=horizon)
+            best_model_name = 'Linear Regression'
+            
+        if not forecast_results:
+             return jsonify({"msg": "Could not generate forecast. Check data quality."}), 500
+        
+        predictions_output = []
+        for result in forecast_results:
+            future_date = result['date']
+            pred_value = result['predicted_value']
+            lower = result['lower']
+            upper = result['upper']
+            
+            # Save prediction to DB
+            prediction = Prediction(
+                predicted_value=float(pred_value),
+                confidence_lower=float(lower),
+                confidence_upper=float(upper),
+                date=future_date,
+                model_type=best_model_name,
+                accuracy_score=float(accuracy),
+                product=product,
+                region=region
+            )
+            db.session.add(prediction)
+            
+            predictions_output.append({
+                "date": future_date.strftime('%Y-%m-%d'),
+                "predicted_value": round(float(pred_value), 2),
+                "lower_bound": round(float(lower), 2),
+                "upper_bound": round(float(upper), 2)
+            })
 
-    db.session.commit()
-    return jsonify(predictions), 200
+        db.session.commit()
+        return jsonify({
+            "model_used": best_model_name,
+            "accuracy_score": round(accuracy, 4),
+            "predictions": predictions_output
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({"msg": f"Error during prediction: {str(e)}"}), 500
